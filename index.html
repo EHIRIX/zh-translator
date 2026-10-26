@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>실시간 중한 통역</title>
+<style>
+/* 레이아웃: 상단 컨트롤 바 + 아래로 쌓이는 통역 로그. 화면 하나짜리 앱. */
+:root{
+  --bg:#f3f4f2; --panel:#ffffff; --fg:#16181a; --muted:#6b7068;
+  --line:#dcdfd9; --accent:#c8102e; --live:#0a7d4f;
+  --zh:"Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
+  --ko:"Pretendard","Apple SD Gothic Neo","Noto Sans KR","Malgun Gothic",sans-serif;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#121413; --panel:#1b1e1c; --fg:#eceee9; --muted:#8d938a;
+  --line:#2c302d; --accent:#ff4d5e; --live:#3ecf8e; color-scheme:dark}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font:15px/1.5 var(--ko);
+  display:flex;flex-direction:column;
+  padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+header{padding:12px max(16px,env(safe-area-inset-left,0px)) 12px max(16px,env(safe-area-inset-right,0px));
+  border-bottom:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;gap:10px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+h1{font-size:16px;margin:0;font-weight:700;letter-spacing:.02em;flex:1}
+.status{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.on .dot{background:var(--live);animation:p 1s infinite}
+@keyframes p{50%{opacity:.3}}
+@media (prefers-reduced-motion:reduce){.on .dot{animation:none}}
+button,select,input{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);
+  border-radius:6px;padding:8px 12px}
+button{cursor:pointer}
+button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+#go{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:700;min-width:96px}
+#go.stop{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+input{flex:1;min-width:0}
+details summary{font-size:12px;color:var(--muted);cursor:pointer}
+main{flex:1;overflow-y:auto;padding:12px max(16px,env(safe-area-inset-left,0px)) 24px max(16px,env(safe-area-inset-right,0px));
+  display:flex;flex-direction:column;gap:12px}
+.seg{border-left:3px solid var(--line);padding:2px 0 2px 12px}
+.seg .src{font-family:var(--zh);font-size:13px;color:var(--muted)}
+.seg .dst{font-size:19px;line-height:1.45;font-weight:600}
+.seg.pending .dst{color:var(--muted);font-weight:400}
+.seg.err .dst{color:var(--accent);font-size:14px}
+#interim{font-family:var(--zh);color:var(--muted);font-size:15px;min-height:1.5em;font-style:italic}
+.empty{color:var(--muted);font-size:14px;margin:auto 0}
+.tts{font-size:12px;padding:2px 8px;margin-top:4px}
+</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <h1>실시간 중한 통역</h1>
+    <span class="status" id="status"><span class="dot"></span><span id="stxt">대기</span></span>
+  </div>
+  <div class="row">
+    <select id="dir" aria-label="방향">
+      <option value="zh">중국어 → 한국어</option>
+      <option value="ko">한국어 → 중국어</option>
+    </select>
+    <button id="go">듣기 시작</button>
+    <button id="clear">지우기</button>
+  </div>
+  <details id="setup">
+    <summary>설정 · API 키</summary>
+    <div class="row" style="margin-top:8px">
+      <input id="key" type="password" placeholder="Anthropic API 키 (sk-ant-...)" autocomplete="off">
+      <button id="save">저장</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <label><input id="autotts" type="checkbox" style="flex:none"> 한→중 번역 결과 자동 음성 출력</label>
+    </div>
+  </details>
+</header>
+<main id="log">
+  <div class="empty" id="empty">API 키 저장 후 '듣기 시작'. 중국어 대화가 문장 단위로 한국어로 표시됩니다.</div>
+  <div id="interim"></div>
+</main>
+<script>
+const MODEL = "claude-haiku-5-5";
+const $ = id => document.getElementById(id);
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null, running = false, history = [];
+
+function store(k,v){try{v===undefined?null:localStorage.setItem(k,v)}catch(e){}}
+function load(k){try{return localStorage.getItem(k)}catch(e){return null}}
+$("key").value = load("ak") || "";
+if(!$("key").value) $("setup").open = true;
+$("save").onclick = () => { store("ak",$("key").value.trim()); $("setup").open=false; };
+
+function setStatus(t,on){ $("stxt").textContent=t; $("status").classList.toggle("on",!!on); }
+if(!SR){ setStatus("이 브라우저는 음성인식 미지원 — Chrome/Safari 사용"); $("go").disabled=true; }
+
+function addSeg(src){
+  $("empty")?.remove();
+  const d=document.createElement("div"); d.className="seg pending";
+  d.innerHTML='<div class="src"></div><div class="dst">번역 중…</div>';
+  d.querySelector(".src").textContent=src;
+  $("log").insertBefore(d,$("interim"));
+  $("log").scrollTop=$("log").scrollHeight;
+  return d;
+}
+
+async function translate(text, seg){
+  const key = load("ak") || $("key").value.trim();
+  const zh2ko = $("dir").value==="zh";
+  if(!key){ seg.className="seg err"; seg.querySelector(".dst").textContent="API 키가 없습니다. 설정에서 저장하세요."; return; }
+  const ctx = history.slice(-4).map(h=>h.src).join("\n");
+  const sys = zh2ko
+    ? "You are a live interpreter. Translate spoken Mandarin Chinese (speech-recognition output, may contain errors or homophone mistakes) into natural, concise Korean. Fix obvious recognition errors using context. Business/industrial context: coffee roasting machines, manufacturing, trade. Output ONLY the Korean translation."
+    : "You are a live interpreter. Translate spoken Korean (speech-recognition output) into natural Simplified Chinese (Mandarin). Business/industrial context: coffee roasting machines, manufacturing, trade. Output ONLY the Chinese translation.";
+  const user = (ctx? "Previous lines (context only, do not translate):\n"+ctx+"\n\n":"") + "Translate:\n"+text;
+  try{
+    const r = await fetch("https://api.anthropic.com/v1/messages",{
+      method:"POST",
+      headers:{"content-type":"application/json","x-api-key":key,"anthropic-version":"2023-06-01",
+               "anthropic-dangerous-direct-browser-access":"true"},
+      body:JSON.stringify({model:MODEL,max_tokens:400,system:sys,messages:[{role:"user",content:user}]})
+    });
+    const j = await r.json();
+    if(!r.ok) throw new Error(j.error?.message || ("HTTP "+r.status));
+    const out = (j.content||[]).map(c=>c.text||"").join("").trim();
+    seg.className="seg"; seg.querySelector(".dst").textContent=out;
+    history.push({src:text,dst:out});
+    if(!zh2ko){
+      const b=document.createElement("button"); b.className="tts"; b.textContent="중국어로 읽기";
+      b.onclick=()=>speak(out); seg.appendChild(b);
+      if($("autotts").checked) speak(out);
+    }
+  }catch(e){
+    seg.className="seg err"; seg.querySelector(".dst").textContent="번역 실패: "+e.message;
+  }
+  $("log").scrollTop=$("log").scrollHeight;
+}
+
+function speak(t){
+  try{ speechSynthesis.cancel(); const u=new SpeechSynthesisUtterance(t); u.lang="zh-CN"; speechSynthesis.speak(u);}catch(e){}
+}
+
+function start(){
+  rec = new SR();
+  rec.lang = $("dir").value==="zh" ? "zh-CN" : "ko-KR";
+  rec.continuous = true; rec.interimResults = true;
+  rec.onresult = ev => {
+    let interim="";
+    for(let i=ev.resultIndex;i<ev.results.length;i++){
+      const r=ev.results[i], t=r[0].transcript.trim();
+      if(r.isFinal){ if(t){ translate(t, addSeg(t)); } }
+      else interim+=t;
+    }
+    $("interim").textContent=interim;
+  };
+  rec.onerror = e => {
+    if(e.error==="no-speech"||e.error==="aborted") return;
+    const m = {"not-allowed":"마이크 권한 거부됨","network":"음성인식 서버 연결 실패 (중국 내라면 VPN 필요)","audio-capture":"마이크 없음"}[e.error]||e.error;
+    setStatus(m,false); running=false; $("go").textContent="듣기 시작"; $("go").classList.remove("stop");
+  };
+  rec.onend = () => { if(running){ try{rec.start()}catch(e){} } else setStatus("대기",false); };
+  rec.start(); running=true;
+  setStatus(rec.lang==="zh-CN"?"듣는 중 · 中文":"듣는 중 · 한국어",true);
+  $("go").textContent="정지"; $("go").classList.add("stop");
+}
+function stop(){ running=false; try{rec&&rec.stop()}catch(e){} $("interim").textContent="";
+  $("go").textContent="듣기 시작"; $("go").classList.remove("stop"); setStatus("대기",false); }
+
+$("go").onclick = () => running ? stop() : start();
+$("dir").onchange = () => { if(running){ stop(); start(); } };
+$("clear").onclick = () => { history=[]; document.querySelectorAll(".seg").forEach(n=>n.remove()); };
+</script>
+</body>
+</html>
