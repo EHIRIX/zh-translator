@@ -68,6 +68,7 @@ main{flex:1;overflow-y:auto;padding:12px max(16px,env(safe-area-inset-left,0px))
     <div class="row" style="margin-top:8px">
       <input id="key" type="password" placeholder="Anthropic API 키 (sk-ant-...)" autocomplete="off">
       <button id="save">저장</button>
+      <button id="test">연결 테스트</button>
     </div>
     <div class="row" style="margin-top:8px">
       <label><input id="autotts" type="checkbox" style="flex:none"> 한→중 번역 결과 자동 음성 출력</label>
@@ -130,7 +131,10 @@ async function translate(text, seg){
       if($("autotts").checked) speak(out);
     }
   }catch(e){
-    seg.className="seg err"; seg.querySelector(".dst").textContent="번역 실패: "+e.message;
+    const net = e instanceof TypeError || /load failed|failed to fetch/i.test(e.message);
+    seg.className="seg err"; seg.querySelector(".dst").textContent = net
+      ? "번역 서버 접속 불가 — 중국 내에선 VPN 필요 ("+e.message+")"
+      : "번역 실패: "+e.message;
   }
   $("log").scrollTop=$("log").scrollHeight;
 }
@@ -154,7 +158,9 @@ function start(){
   };
   rec.onerror = e => {
     if(e.error==="no-speech"||e.error==="aborted") return;
-    const m = {"not-allowed":"마이크 권한 거부됨","network":"음성인식 서버 연결 실패 (중국 내라면 VPN 필요)","audio-capture":"마이크 없음"}[e.error]||e.error;
+    const m = {"not-allowed":"마이크 권한 거부됨 — 주소창 왼쪽 'ㄱ가' → 웹사이트 설정 → 마이크 허용",
+      "service-not-allowed":"음성인식 꺼짐 — 아이폰 설정 → 일반 → 키보드 → 받아쓰기 켜기",
+      "network":"음성인식 서버 연결 실패 (VPN 확인)","audio-capture":"마이크 없음"}[e.error]||("음성인식 오류: "+e.error);
     setStatus(m,false); running=false; $("go").textContent="듣기 시작"; $("go").classList.remove("stop");
   };
   rec.onend = () => { if(running){ try{rec.start()}catch(e){} } else setStatus("대기",false); };
@@ -165,6 +171,7 @@ function start(){
 function stop(){ running=false; try{rec&&rec.stop()}catch(e){} $("interim").textContent="";
   $("go").textContent="듣기 시작"; $("go").classList.remove("stop"); setStatus("대기",false); }
 
+$("test").onclick = () => { $("empty")?.remove(); translate("你好，我们是做咖啡烘焙机的。", addSeg("[테스트] 你好，我们是做咖啡烘焙机的。")); };
 $("go").onclick = () => running ? stop() : start();
 $("dir").onchange = () => { if(running){ stop(); start(); } };
 $("clear").onclick = () => { history=[]; document.querySelectorAll(".seg").forEach(n=>n.remove()); };
